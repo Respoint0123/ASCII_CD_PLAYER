@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import pathlib
 import re
@@ -1025,6 +1026,77 @@ class TestCacheSafety(unittest.TestCase):
             finally:
                 os.close(fd)
             self.assertTrue(part.exists(), "别的实例正在写的 .part 不能删")
+
+    def test_purge_holds_disc_lock_until_files_are_gone(self):
+        """#25：检查和删除必须在同一把锁里。
+
+        旧实现先探一下锁、马上放开，再删文件；另一实例正好在这个空档拿到
+        盘锁开始抓轨，它写下的 .pcm.part 就会被当成旧缓存删掉。这里在删除
+        动作进行中开第二个实例去抢同一把锁：必须抢不到。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            keep = build_fake_disc(durations=(1.0,))
+            busy = build_fake_disc(durations=(2.0,))
+            cache = Cache(tmp)
+            cache.ensure_format()                  # 先有 format.json 和根锁
+            cache.ensure_dir(busy)
+            (cache.disc_dir(busy) / "01.pcm").write_bytes(b"stale")
+
+            seen = {}
+            real_remove = cache._remove_audio
+
+            def remove_between_check_and_delete(path):
+                other = Cache(tmp)
+                # 另一实例此刻启动，想拿这张盘的锁开抓
+                seen["acquired"] = other.acquire(busy)
+                if seen["acquired"]:
+                    other.part_path(busy, 1).write_bytes(b"active")
+                real_remove(path)
+                other.close()
+
+            with mock.patch.object(cache, "_remove_audio",
+                                   remove_between_check_and_delete):
+                cache.purge_except(keep)
+
+            self.assertFalse(seen["acquired"],
+                             "清理期间不能把盘锁让给别的实例")
+            self.assertFalse((cache.disc_dir(busy) / "01.pcm").exists(),
+                             "旧盘的 PCM 还是要清掉")
+
+    def test_format_migration_skips_disc_in_use(self):
+        """#25：换 PCM 格式时，另一实例正在抓的盘整块跳过，曲名缓存也留着。"""
+        import fcntl
+
+        from config import PCM_FORMAT_VERSION
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            cache = Cache(tmp)
+            active = build_fake_disc(durations=(1.0,))
+            stale = build_fake_disc(durations=(2.0,))
+            cache.ensure_dir(active)
+            cache.ensure_dir(stale)
+            cache.write_meta(active, {"album": "正在抓的盘"})
+            (cache.disc_dir(active) / "01.pcm").write_bytes(b"old")
+            (cache.disc_dir(active) / "01.pcm.part").write_bytes(b"active")
+            (cache.disc_dir(stale) / "01.pcm").write_bytes(b"stale")
+            (root / "format.json").write_text('{"pcm_version": 1}')
+            fd = os.open(cache.disc_dir(active) / ".lock",
+                         os.O_RDWR | os.O_CREAT)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                cache.ensure_format()
+            finally:
+                os.close(fd)
+
+            self.assertTrue((cache.disc_dir(active) / "01.pcm").exists())
+            self.assertTrue((cache.disc_dir(active) / "01.pcm.part").exists(),
+                            "别的实例正在写的半成品不能删")
+            self.assertTrue(cache.meta_path(active).exists(), "曲名缓存留下")
+            self.assertFalse((cache.disc_dir(stale) / "01.pcm").exists(),
+                             "没人在用的旧格式 PCM 还是要清")
+            self.assertEqual(json.loads((root / "format.json").read_text())
+                             ["pcm_version"], PCM_FORMAT_VERSION)
 
     def test_purge_keeps_foreign_files_in_disc_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2991,7 +3063,7 @@ class TestVersion(unittest.TestCase):
         match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
         self.assertIsNotNone(match, "pyproject.toml 里找不到 version")
         self.assertEqual(match.group(1), VERSION)
-        self.assertEqual(VERSION, "0.1.0")
+        self.assertEqual(VERSION, "0.1.1")
 
 
 if __name__ == "__main__":

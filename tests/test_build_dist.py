@@ -62,6 +62,21 @@ class TestBuildOutputSafety(unittest.TestCase):
             self.assertEqual((out / "user-note.txt").read_text(encoding="utf-8"),
                              "keep")
 
+    def test_rebuild_drops_previous_version_archive(self):
+        """版本号升了以后，上一版归档不能留在 dist/ 里被误传。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "dist"
+            build_dist.build(out)
+            stale = out / "asciicd-v0.9.9-linux.tar.gz"
+            stale.write_bytes(b"old release")
+
+            build_dist.build(out)
+
+            self.assertFalse(stale.exists(), "旧版本归档要清掉")
+            self.assertEqual(
+                sorted(p.name for p in out.glob("asciicd-v*.tar.gz")),
+                [build_dist.ARCHIVE_NAME])
+
     def test_refuses_foreign_nonempty_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = pathlib.Path(tmp) / "dist"
@@ -138,7 +153,7 @@ class TestBuildOutputSafety(unittest.TestCase):
     def test_version_is_single_sourced(self):
         from config import VERSION
 
-        self.assertEqual(VERSION, "0.1.0")
+        self.assertEqual(VERSION, "0.1.1")
         self.assertEqual(build_dist.VERSION, VERSION)
         self.assertEqual(build_dist.pyproject_version(), VERSION,
                          "pyproject.toml 与 config.VERSION 必须一致")

@@ -54,6 +54,13 @@ MANAGED_FILES = ("asciicd.pyz", "asciicd", "asciicd.desktop",
 MANAGED_DIRS = ("fonts",)
 MANAGED = frozenset(MANAGED_FILES + MANAGED_DIRS
                     + (MARKER, ARCHIVE_NAME) + LEGACY_ARCHIVES)
+# 版本号变了以后，上一版留下的归档也要算自己的产物，重建时清掉，
+# 免得 dist/ 里同时躺着两个版本、发布时传错文件。
+_ARCHIVE_RE = re.compile(r"^asciicd-v\d+\.\d+\.\d+-linux\.tar\.gz$")
+
+
+def _is_managed_name(name: str) -> bool:
+    return name in MANAGED or _ARCHIVE_RE.match(name) is not None
 
 
 class BuildError(RuntimeError):
@@ -192,10 +199,20 @@ HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 APP_DIR="$DATA_HOME/asciicd"
+BIN_FILE="$BIN_DIR/asciicd"
 DESKTOP_DIR="$DATA_HOME/applications"
 DESKTOP_FILE="$DESKTOP_DIR/asciicd.desktop"
+INSTALL_MARK="$APP_DIR/.asciicd-install"
+# 安装器提供的字体文件；fonts/ 里别的条目是用户自己加的字体，升级/卸载都保留
+FONT_OWNED="PixelMplus12-Regular.ttf unifont.otf LICENSE-PixelMplus12.txt LICENSE-Unifont.txt README.md SHA256SUMS"
 PATH_MARK_BEGIN="# >>> asciicd PATH >>>"
 PATH_MARK_END="# <<< asciicd PATH <<<"
+
+# 归一化后的安装目录：判断软链指向哪里时用；$HOME 本身是软链也骗不过去
+APP_DIR_REAL="$(readlink -m -- "$APP_DIR" 2>/dev/null || printf '%s' "$APP_DIR")"
+case "$APP_DIR" in
+    ""|/) echo "✘ 安装目录算出来是 '$APP_DIR'，拒绝继续。" >&2; exit 1 ;;
+esac
 
 usage() {
     cat <<'USAGE'
@@ -203,6 +220,9 @@ usage() {
   （默认）       复制到 ~/.local/share/asciicd，装命令软链和桌面菜单项
   --add-path     把 ~/.local/bin 追加进当前 shell 的 rc（带标记，可撤销）
   --uninstall    删除程序、命令、菜单项，以及 --add-path 加的 PATH 段
+
+安装目录、命令、菜单项已经存在但不属于 asciicd 时，安装会拒绝并列出冲突
+路径，不会改动这些文件。
 USAGE
 }
 
@@ -226,22 +246,157 @@ remove_path_block() {
     fi
 }
 
-if [ "$UNINSTALL" = "1" ]; then
-    if [ -L "$BIN_DIR/asciicd" ]; then
-        target="$(readlink -f "$BIN_DIR/asciicd" 2>/dev/null || true)"
-        case "$target" in "$APP_DIR"/*) rm -f "$BIN_DIR/asciicd" ;; esac
+# ── 归属判断 ───────────────────────────────────────────────────────────────
+# 三个目标（安装目录、命令、菜单项）都可能已经被用户自己的文件占着。动手
+# 之前先认清：absent = 空位，ours = 本应用装的（可覆盖、可卸载），
+# foreign = 别人的（安装时直接中止，卸载时原样保留）。
+
+app_dir_state() {
+    local dir="$1" entry name only_fonts
+    if [ -L "$dir" ]; then echo foreign; return; fi
+    if [ ! -e "$dir" ]; then echo absent; return; fi
+    if [ ! -d "$dir" ]; then echo foreign; return; fi
+    if [ -z "$(ls -A -- "$dir" 2>/dev/null)" ]; then
+        # 空目录没有归属可言，当 ours 处理：装/卸都可以直接收掉，不会丢文件
+        echo ours; return
     fi
-    rm -f "$DESKTOP_FILE"
+    if [ -f "$INSTALL_MARK" ] && [ ! -L "$INSTALL_MARK" ]; then
+        echo ours; return
+    fi
+    # 卸载后只剩用户自定义字体（fonts/）的目录：装回来时不能当冲突
+    if [ -d "$dir/fonts" ] && [ ! -L "$dir/fonts" ]; then
+        only_fonts=1
+        for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            if [ "${entry##*/}" != "fonts" ]; then only_fonts=0; break; fi
+        done
+        if [ "$only_fonts" = "1" ]; then echo ours; return; fi
+    fi
+    # 兼容 0.1.0 的安装：程序本体、启动器、安装脚本三件套齐全，就是我们的
+    # 安装。此时多出来的文件是用户后来放的，升级会原样保留。
+    if [ -L "$dir/asciicd.pyz" ] || [ ! -f "$dir/asciicd.pyz" ]; then
+        echo foreign; return
+    fi
+    if [ -f "$dir/asciicd" ] && [ ! -L "$dir/asciicd" ] &&
+       [ -f "$dir/install.sh" ] && [ ! -L "$dir/install.sh" ]; then
+        echo ours; return
+    fi
+    # 装到一半（文件不齐）时保守些：只有全是我们的文件才认领
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name="${entry##*/}"
+        case "$name" in
+            asciicd.pyz|asciicd|install.sh|asciicd.desktop|LICENSE|README.txt|fonts|.asciicd-install)
+                ;;
+            *) echo foreign; return ;;
+        esac
+    done
+    echo ours
+}
+
+bin_state() {
+    local link="$1" target
+    if [ -L "$link" ]; then
+        target="$(readlink -m -- "$link" 2>/dev/null || readlink -- "$link" 2>/dev/null || true)"
+        case "$target" in
+            "$APP_DIR_REAL/asciicd") echo ours ;;
+            *) echo foreign ;;
+        esac
+        return
+    fi
+    if [ -e "$link" ]; then echo foreign; return; fi
+    echo absent
+}
+
+desktop_state() {
+    local file="$1"
+    if [ -L "$file" ]; then echo foreign; return; fi
+    if [ ! -e "$file" ]; then echo absent; return; fi
+    if [ ! -f "$file" ]; then echo foreign; return; fi
+    # 只认本应用模板写出来的菜单项；用户自己的同名文件不动
+    if grep -qxF "Name=asciicd" "$file" 2>/dev/null &&
+       grep -qxF "Comment=Console CD-DA player with character-art spectrum" "$file" 2>/dev/null &&
+       grep -qxF "Icon=media-optical" "$file" 2>/dev/null; then
+        echo ours
+    else
+        echo foreign
+    fi
+}
+
+# fonts/ 里只清安装器提供的字体和许可文件，用户自己加的字体原样保留。
+remove_install_fonts() {
+    local dir="$1" name
+    for name in $FONT_OWNED; do
+        rm -f -- "$dir/$name"
+    done
+}
+
+# 安装器自己放进去的条目。升级和卸载只动这些，其余都算用户的。
+remove_install_files() {
+    local dir="$1" entry name
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name="${entry##*/}"
+        case "$name" in
+            fonts)
+                if [ -d "$entry" ] && [ ! -L "$entry" ]; then
+                    remove_install_fonts "$entry"
+                    rmdir -- "$entry" 2>/dev/null || true
+                else
+                    rm -rf -- "$entry"
+                fi ;;
+            asciicd.pyz|asciicd|install.sh|asciicd.desktop|LICENSE|README.txt|.asciicd-install)
+                rm -rf -- "$entry" ;;
+        esac
+    done
+}
+
+# 卸载时只删安装器放进去的文件；用户后来塞进安装目录的东西原样留着。
+# 返回 0 = 目录已经清空并删掉，1 = 还剩不属于 asciicd 的文件。
+remove_app_dir() {
+    local dir="$1"
+    remove_install_files "$dir"
+    if [ -z "$(ls -A -- "$dir" 2>/dev/null)" ]; then
+        rmdir -- "$dir" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+if [ "$UNINSTALL" = "1" ]; then
+    # 先把三处归属都认一遍再动手：安装目录删掉以后，软链就悬空了，认不出来
+    app_state="$(app_dir_state "$APP_DIR")"
+    bin_owner="$(bin_state "$BIN_FILE")"
+    desktop_owner="$(desktop_state "$DESKTOP_FILE")"
+    skipped=()
+    if [ "$bin_owner" = "ours" ]; then
+        rm -f -- "$BIN_FILE"
+    elif [ "$bin_owner" = "foreign" ]; then
+        skipped+=("$BIN_FILE（不是 asciicd 装的命令）")
+    fi
+    if [ "$desktop_owner" = "ours" ]; then
+        rm -f -- "$DESKTOP_FILE"
+    elif [ "$desktop_owner" = "foreign" ]; then
+        skipped+=("$DESKTOP_FILE（不是 asciicd 的菜单项）")
+    fi
+    if [ "$app_state" = "ours" ]; then
+        if ! remove_app_dir "$APP_DIR"; then
+            skipped+=("$APP_DIR（里面还有不是 asciicd 的文件，目录保留）")
+        fi
+    elif [ "$app_state" = "foreign" ]; then
+        skipped+=("$APP_DIR（不是 asciicd 的安装目录）")
+    fi
     remove_path_block "$HOME/.bashrc"
     remove_path_block "$HOME/.zshrc"
-    if [ "$APP_DIR" = "$DATA_HOME/asciicd" ]; then
-        rm -rf -- "$APP_DIR"
+    echo "已卸载 asciicd：$APP_DIR、$BIN_FILE、$DESKTOP_FILE"
+    if [ ${#skipped[@]} -gt 0 ]; then
+        echo "下面这些路径不属于 asciicd，原样保留：" >&2
+        printf '    %s\n' "${skipped[@]}" >&2
     fi
-    echo "已卸载 asciicd：$APP_DIR、$BIN_DIR/asciicd、$DESKTOP_FILE"
     exit 0
 fi
 
-if [ "$HERE" = "$APP_DIR" ]; then
+if [ "$HERE" = "$APP_DIR_REAL" ]; then
     echo "这是安装目录本身；重装请用新发布包里的 install.sh（卸载用 ./install.sh --uninstall）。" >&2
     exit 1
 fi
@@ -250,22 +405,47 @@ if [ ! -f "$HERE/asciicd.pyz" ]; then
     exit 1
 fi
 
+# 三个目标都必须是空位或本应用自己的，否则一个字节都不动
+conflicts=()
+if [ "$(app_dir_state "$APP_DIR")" = "foreign" ]; then
+    conflicts+=("$APP_DIR（已存在，但不是 asciicd 的安装目录）")
+fi
+if [ "$(bin_state "$BIN_FILE")" = "foreign" ]; then
+    conflicts+=("$BIN_FILE（已存在，但不是 asciicd 装的软链）")
+fi
+if [ "$(desktop_state "$DESKTOP_FILE")" = "foreign" ]; then
+    conflicts+=("$DESKTOP_FILE（已存在，但不是 asciicd 的菜单项）")
+fi
+if [ ${#conflicts[@]} -gt 0 ]; then
+    echo "✘ 安装已中止：下面这些路径已经存在，但不是 asciicd 的。" >&2
+    printf '    %s\n' "${conflicts[@]}" >&2
+    echo "  没有改动任何文件。确认可以覆盖的话，先把它们挪走或删掉，再重新运行。" >&2
+    exit 1
+fi
+
 mkdir -p "$BIN_DIR" "$DESKTOP_DIR"
 
-# 固定目录：解压目录以后可以删/移动，安装不会断链
-rm -rf -- "$APP_DIR"
+# 固定目录：解压目录以后可以删/移动，安装不会断链。
+# 升级只清掉安装器自己的文件，用户后放进来的文件和子目录原样保留。
 mkdir -p "$APP_DIR"
+remove_install_files "$APP_DIR"
+# 归属标记：升级和卸载靠它确认这个目录是本应用装的
+printf 'asciicd install marker\ninstall_dir=%s\n' "$APP_DIR" > "$INSTALL_MARK"
 # install.sh / .desktop 也放进固定目录：解压包删掉后仍能从这里卸载
 for item in asciicd.pyz asciicd install.sh asciicd.desktop LICENSE README.txt; do
     if [ -e "$HERE/$item" ]; then cp -a "$HERE/$item" "$APP_DIR/"; fi
 done
-if [ -d "$HERE/fonts" ]; then cp -a "$HERE/fonts" "$APP_DIR/fonts"; fi
+if [ -d "$HERE/fonts" ]; then
+    # 合并进已有 fonts/：我们发的字体覆盖，用户自己加的字体留着
+    mkdir -p "$APP_DIR/fonts"
+    cp -a "$HERE/fonts/." "$APP_DIR/fonts/"
+fi
 chmod +x "$APP_DIR/asciicd" "$APP_DIR/asciicd.pyz"
 
-ln -sfn "$APP_DIR/asciicd" "$BIN_DIR/asciicd"
+ln -sfn "$APP_DIR/asciicd" "$BIN_FILE"
 
 # .desktop 的 Exec 必须按规范引用：路径里有空格/引号/`$`/`%` 都得出得去
-exec_path="$BIN_DIR/asciicd"
+exec_path="$BIN_FILE"
 escaped="$exec_path"
 escaped="${escaped//\\/\\\\}"
 escaped="${escaped//\"/\\\"}"
@@ -301,7 +481,7 @@ fi
 
 echo "已安装："
 echo "  程序      $APP_DIR/asciicd.pyz"
-echo "  命令      $BIN_DIR/asciicd"
+echo "  命令      $BIN_FILE"
 echo "  菜单项    $DESKTOP_FILE"
 echo
 echo "直接运行： asciicd          （有 kitty 就开独立点阵字体窗口）"
@@ -328,6 +508,10 @@ README = """asciicd — 控制台 CD-DA 播放器（字符频谱 / 声谱图）
     ./install.sh --add-path   # 顺便把 ~/.local/bin 加进 PATH（带标记，可撤销）
     ./install.sh --uninstall  # 卸载程序、命令、菜单项和 PATH 配置段
 
+安装目录、命令或菜单项已经有同名文件、但确认不是 asciicd 装的，安装会列出
+冲突路径并退出，不会覆盖；卸载同样只清 asciicd 自己装的东西。升级只替换程序
+文件，你后来放进安装目录的文件和子目录会保留（`fonts/` 里自己加的字体也算）。
+
 运行：
     asciicd                  # 打开一个独立的、自带点阵字体的终端窗口
     asciicd --theme jpop     # 配色：phosphor / amber / jpop / modern
@@ -341,7 +525,7 @@ README = """asciicd — 控制台 CD-DA 播放器（字符频谱 / 声谱图）
     --paused --wait-disc  开机自启用：先停在停止态、没盘停在等待画面（配合 Hyprland 窗口规则做默认界面）
     --on-eject continue|stop  弹盘行为：继续播缓存 / 立即停（默认 continue）
     --on-insert play|pause    插盘行为：自动开播 / 等空格（默认 play）
-    --version                 打印版本（asciicd 0.1.0）
+    --version                 打印版本（asciicd 0.1.1）
 
 常用按键：
     space 播放/暂停   s 停止   h 帮助   l/m 布局   t 主题   q 退出
@@ -421,7 +605,7 @@ def looks_like_our_output(out: Path) -> bool:
     try:
         with os.scandir(out) as entries:
             for entry in entries:
-                if entry.name not in MANAGED:
+                if not _is_managed_name(entry.name):
                     return False
     except OSError:
         return False
@@ -455,9 +639,9 @@ def prepare_output(out: Path) -> None:
             raise BuildError(
                 f"输出目录非空，且不是本构建器创建的：{out}\n"
                 "  为免误删，这里不会动它；换一个 --out，或手动清空该目录。")
-        for name in (MANAGED_FILES + MANAGED_DIRS
-                     + (ARCHIVE_NAME,) + LEGACY_ARCHIVES):
-            _remove_managed(out / name)
+        for entry in list(out.iterdir()):
+            if _is_managed_name(entry.name):
+                _remove_managed(entry)
     else:
         out.mkdir(parents=True)
     try:

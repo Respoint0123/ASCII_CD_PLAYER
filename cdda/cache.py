@@ -12,6 +12,7 @@ import re
 import shutil
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from cdda.device import Disc
@@ -103,6 +104,7 @@ class Cache:
         self._meta_cache: tuple[tuple[str, float], dict] | None = None
         self._root_fd: int | None = None
         self._disc_fd: int | None = None
+        self._disc_path: Path | None = None   # 当前独占锁住的那张盘
 
     @classmethod
     def isolated(cls, prefix: str = "asciicd-cache-") -> "Cache":
@@ -226,29 +228,17 @@ class Cache:
             self.ensure_dir(disc)
         except OSError:
             return False
-        fd = self._open_disc_lock(d)
+        fd = _open_exclusive(d / _LOCK)
         if fd is None:
             return False
         self._disc_fd = fd
+        self._disc_path = d
         return True
-
-    def _open_disc_lock(self, d: Path) -> int | None:
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(d / _LOCK, flags, 0o600)
-        except OSError:
-            return None
-        if fcntl is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                os.close(fd)
-                return None
-        return fd
 
     def close(self) -> None:
         """释放锁；实例私有缓存连目录一起删掉。"""
         fd, self._disc_fd = self._disc_fd, None
+        self._disc_path = None
         if fd is not None:
             _close_fd(fd)
         fd, self._root_fd = self._root_fd, None
@@ -278,10 +268,9 @@ class Cache:
             # 隔离缓存，避免读到格式不对的旧音频。
             return
         # 旧缓存可能字节序/格式不对，宁可重抓。只清确认属于我们的目录里的
-        # 音频文件，别的实例正在用的目录由 _disc_dirs() 跳过。
+        # 音频文件；别的实例正在用的目录由 _purge_dir() 跳过。
         for path in self._disc_dirs():
-            self._remove_audio(path)
-            self._drop_if_empty(path)
+            self._purge_dir(path)
         try:
             self.root.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -293,18 +282,52 @@ class Cache:
         self._meta_cache = None
 
     def _disc_dirs(self):
-        """遍历缓存根下确认属于本应用的 disc 目录（跳过正在被别的实例用的）。"""
+        """遍历缓存根下确认属于本应用的 disc 目录。
+
+        这里只筛选，不加锁：真正动手删之前由 _purge_dir() 抢目标盘的独占锁。
+        """
         try:
             with os.scandir(self.root) as entries:
                 paths = [Path(e.path) for e in entries]
         except OSError:
             return
         for path in paths:
-            if not self._looks_like_ours(path):
-                continue
-            if _dir_in_use(path):
-                continue
-            yield path
+            if self._looks_like_ours(path):
+                yield path
+
+    @contextmanager
+    def _disc_lock(self, path: Path):
+        """临时独占 path 的 .lock；拿不到就说明别的实例正在用这个目录。
+
+        自己已经持锁的盘直接放行：flock 按「打开的描述」算，同进程再开一个
+        fd 去抢自己的锁只会 EWOULDBLOCK，那不是冲突。
+        """
+        if fcntl is None or (self._disc_path is not None
+                             and _same_dir(path, self._disc_path)):
+            yield True
+            return
+        fd = _open_exclusive(path / _LOCK)
+        if fd is None:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            _close_fd(fd)
+
+    def _purge_dir(self, path: Path) -> bool:
+        """持目标盘独占锁清音频和空壳；抢不到锁就整个跳过。
+
+        检查和删除必须在同一把锁里完成：先「看一眼没人用」再放手去删，
+        中间另一实例完全可能拿到锁开始抓轨，它的 .pcm.part 就会被当成旧
+        缓存删掉。meta.json 不在删除名单里，曲名缓存始终保留。
+        """
+        with self._disc_lock(path) as held:
+            if not held:
+                return False
+            self._remove_audio(path)
+            self._drop_if_empty(path)
+            return True
 
     # ── 状态 ──────────────────────────────────────────────────────────────
     def bytes_expected(self, disc: Disc, number: int) -> int:
@@ -489,10 +512,9 @@ class Cache:
         d = self.disc_dir(disc)
         if not self._looks_like_ours(d):
             return
-        self._remove_audio(d)
-        # 本实例自己拿着这把锁，收掉空壳是安全的：剩下的 PCM 已经删完，
-        # 打开的 fd 指向被 unlink 的 inode，不影响 rmdir。
-        self._drop_if_empty(d, ignore_lock=True)
+        # 正常情况下本实例正持着这张盘的锁，_disc_lock() 直接放行；万一锁在
+        # 别的实例手里，宁可不删，也不能删到它正在写的 .pcm.part。
+        self._purge_dir(d)
 
     def purge_except(self, disc: Disc) -> None:
         """换碟时清掉别的盘的音频缓存，但把它们的 meta.json 留下。
@@ -507,8 +529,7 @@ class Cache:
         for path in self._disc_dirs():
             if path.name == keep:
                 continue
-            self._remove_audio(path)
-            self._drop_if_empty(path)
+            self._purge_dir(path)
         self._meta_cache = None
 
     def _remove_audio(self, path: Path) -> None:
@@ -526,16 +547,18 @@ class Cache:
             except OSError:
                 pass
 
-    def _drop_if_empty(self, path: Path, ignore_lock: bool = False) -> None:
-        """只剩归属标记和锁文件时收掉空壳；有 meta.json 的留着。"""
+    def _drop_if_empty(self, path: Path) -> None:
+        """只剩归属标记和锁文件时收掉空壳；有 meta.json 的留着。
+
+        只由 _purge_dir() 在持有目标盘独占锁时调用：这时「空」是自己看准的，
+        不用再问一遍锁；删除时打开的 .lock fd 指向被 unlink 的 inode，无妨。
+        """
         try:
             with os.scandir(path) as entries:
                 for entry in entries:
                     if entry.name not in _HOUSEKEEPING:
                         return
         except OSError:
-            return
-        if not ignore_lock and _dir_in_use(path):
             return
         shutil.rmtree(path, ignore_errors=True)
 
@@ -556,20 +579,27 @@ def _close_fd(fd: int) -> None:
         pass
 
 
-def _dir_in_use(path: Path) -> bool:
-    """这个目录的 .lock 是否被别的进程（或本进程的另一个打开描述）占着。"""
-    if fcntl is None:
-        return False
+def _same_dir(a: Path, b: Path) -> bool:
+    """两个路径是否指向同一个目录（不吃符号链接/相对路径的亏）。"""
     try:
-        fd = os.open(path / _LOCK, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        sa, sb = a.stat(), b.stat()
     except OSError:
         return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
+def _open_exclusive(path: Path) -> int | None:
+    """打开并独占锁一个 .lock 文件；目录不存在、只读或已被占都返回 None。"""
+    if fcntl is None:                     # pragma: no cover - 非 POSIX
+        return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return True
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return False
-    finally:
+        fd = os.open(path, flags, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
         os.close(fd)
+        return None
+    return fd

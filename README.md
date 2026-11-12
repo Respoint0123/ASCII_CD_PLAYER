@@ -10,7 +10,7 @@ Linux terminal audio CD player with progressive ripping and live character-art v
 
 ## 快速开始
 
-从 [Releases](https://github.com/Respoint0123/ASCII_CD_PLAYER/releases) 下载 v0.1.0 的 Linux 分发包并解压，在解压目录里运行下面的命令。
+从 [Releases](https://github.com/Respoint0123/ASCII_CD_PLAYER/releases) 下载 v0.1.1 的 Linux 分发包并解压，在解压目录里运行下面的命令。
 
 ### 1. 安装依赖
 
@@ -72,7 +72,7 @@ asciicd --wait-disc
 ```sh
 asciicd --layout mini    # 窄窗口用极简布局
 asciicd --theme jpop     # 也可选 phosphor、amber、modern
-asciicd --version        # asciicd 0.1.0
+asciicd --version        # asciicd 0.1.1
 asciicd --help
 ```
 
@@ -95,7 +95,7 @@ python3 -m venv .venv
 python3 -m pip install numpy -r requirements-dev.txt
 make test
 make lint
-make build          # 生成 dist/asciicd-v0.1.0-linux.tar.gz
+make build          # 生成 dist/asciicd-v0.1.1-linux.tar.gz
 make check-dist     # 验收产物：文件、权限、字体、许可、归档、CLI 版本
 make smoke          # 伪终端冒烟：画面、退出码、终端恢复
 ```

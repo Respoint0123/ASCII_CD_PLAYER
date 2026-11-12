@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 # ── 元信息 ────────────────────────────────────────────────────────────────
-VERSION = "0.1.0"             # 与 pyproject.toml / 包名 / tag 保持一致
+VERSION = "0.1.1"             # 与 pyproject.toml / 包名 / tag 保持一致
 PROJECT_URL = "https://github.com/Respoint0123/ASCII_CD_PLAYER"
 
 # ── 音频 ──────────────────────────────────────────────────────────────────

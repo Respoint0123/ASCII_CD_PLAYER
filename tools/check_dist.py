@@ -108,7 +108,7 @@ def archive_errors(out: Path, require_fonts: bool = True) -> list[str]:
         for name in REQUIRED_FONT_FILES:
             if f"{prefix}fonts/{name}" not in names:
                 errors.append(f"归档里缺 {prefix}fonts/{name}")
-    # tar 会把顶层目录本身也列成 `asciicd-v0.1.0-linux`（末尾没有 /）
+    # tar 会把顶层目录本身也列成一项（末尾没有 /）
     if any(n != PACKAGE_NAME and not n.startswith(prefix) for n in names):
         errors.append(f"归档根目录不是 {prefix}")
     if f"{prefix}{ARCHIVE_NAME}" in names:
