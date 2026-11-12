@@ -1,0 +1,32 @@
+PixelMplus12-Regular.ttf
+========================
+
+PixelMplus（ピクセル・エムプラス）
+Copyright (C) 2013 itouhiro
+Copyright (C) 2002-2013 M+ FONTS PROJECT
+
+上游：https://github.com/itouhiro/PixelMplus
+来源：https://github.com/itouhiro/PixelMplus（PixelMplus12-Regular.ttf）
+许可：M+ FONT LICENSE
+
+PixelMplus 是把 M+ BITMAP FONTS 轮廓化得到的字体；下面的 M+ FONT LICENSE
+沿用上游发行文件，未做改动。
+
+---
+
+M+ FONTS                                Copyright (C) 2002-2013 M+ FONTS PROJECT
+
+-
+
+LICENSE_E
+
+
+
+
+These fonts are free software.
+Unlimited permission is granted to use, copy, and distribute them, with
+or without modification, either commercially or noncommercially.
+THESE FONTS ARE PROVIDED "AS IS" WITHOUT WARRANTY.
+
+
+http://mplus-fonts.sourceforge.jp/mplus-outline-fonts/

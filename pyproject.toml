@@ -1,0 +1,16 @@
+[project]
+name = "asciicd"
+version = "0.1.0"
+description = "Console CD-DA player with progressive ripping and character-art spectrum"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+exclude = ["concept", "dist", "assets"]
+
+[tool.ruff.lint]
+# 渐进基线：先抓未定义名、语法/导入错误、明显未使用变量。
+# 不启用 E501/格式化类规则，避免一次性制造大量无关 diff。
+select = ["E4", "E7", "E9", "F"]

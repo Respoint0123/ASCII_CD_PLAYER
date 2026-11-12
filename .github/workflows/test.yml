@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test deps
+        run: python -m pip install --upgrade pip numpy -r requirements-dev.txt
+
+      - name: Lint (controlled rule set)
+        if: matrix.python-version == '3.14'
+        run: ruff check .
+
+      - name: Unit tests (no CD drive, no terminal needed)
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Install pw-cat for dist checks
+        if: matrix.python-version == '3.14'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pipewire-bin
+
+      - name: Build Linux bundle
+        if: matrix.python-version == '3.14'
+        run: python tools/build_dist.py
+
+      - name: Verify bundle (files, perms, fonts, licenses, archive, CLI)
+        if: matrix.python-version == '3.14'
+        run: python tools/check_dist.py
+
+      - name: PTY smoke (screen, exit code, terminal restore)
+        if: matrix.python-version == '3.14'
+        run: python tools/pty_smoke.py --check
